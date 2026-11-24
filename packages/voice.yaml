@@ -79,6 +79,13 @@ globals:
     type: bool
     restore_value: false
     initial_value: "false"
+  # Only this turn's announcement counts as a TTS playback start. on_end may
+  # arrive before the media player begins, and is_playing may be false between
+  # decoding and I2S shutdown. Marked in hardware.yaml/on_announcement.
+  - id: tts_playback_seen
+    type: bool
+    restore_value: false
+    initial_value: "false"
   # Der Bestaetigungston ist faellig. Gespielt wird er nicht sofort, sondern in
   # end_session - siehe dort, es geht um den I2S-Bus.
   - id: confirm_pending
@@ -174,6 +181,7 @@ voice_assistant:
     - microphone: mic
       channels: 1
   media_player: media_out
+  tts_playback_start_timeout: 18s
   micro_wake_word: mww
   use_wake_word: false
   # Laeuft nicht auf dem Geraet: der Wert geht nur als Zahl im API-Request an
@@ -245,6 +253,7 @@ voice_assistant:
         // ohne Bedenkzeit aufraeumen.
         id(pipeline_session) = true;
         id(had_tts) = false;
+        id(tts_playback_seen) = false;
         id(result_kind) = 0;
         // Ein vorgemerkter Ton aus einem abgebrochenen Durchgang gehoert nicht
         // in den neuen hinein.
@@ -265,11 +274,27 @@ voice_assistant:
     - script.execute: update_ui
 
   on_stt_vad_end:
+    # Release both microphone consumers after speech input ends. The I2S RX
+    # driver is asynchronous; stopping only the wake-word engine can leave the
+    # underlying microphone capturing while the TTS DAC requests the bus.
+    - micro_wake_word.stop:
+    - microphone.stop_capture:
+        id: mic
+    - logger.log:
+        level: INFO
+        format: "LUMI-AUDIO: VAD end; microphone stop requested"
     - lambda: id(voice_assistant_phase) = ${phase_thinking};
     - script.execute: update_ui
 
   # x = erkannter Text des Nutzers
   on_stt_end:
+    # Some STT providers omit the VAD-end event: this path is the fallback.
+    - micro_wake_word.stop:
+    - microphone.stop_capture:
+        id: mic
+    - logger.log:
+        level: INFO
+        format: "LUMI-AUDIO: STT end; microphone stop requested"
     - text_sensor.template.publish:
         id: text_request
         state: !lambda return x;
@@ -284,6 +309,15 @@ voice_assistant:
   # ueber den Satz - mehr ist ohne eine Automation in Home Assistant nicht
   # moeglich. Erkennt sie nichts, bleibt alles wie bisher bei den fuenf Balken.
   on_tts_start:
+    # Final safety net before media playback. The TTS URL is passed to the
+    # media player by ESPHome; this event does NOT itself indicate audio start.
+    - micro_wake_word.stop:
+    - microphone.stop_capture:
+        id: mic
+    - lambda: id(tts_playback_seen) = false;
+    - logger.log:
+        level: INFO
+        format: "LUMI-AUDIO: TTS text received; I2S microphone release requested"
     - lambda: |-
         id(had_tts) = true;
 
@@ -831,24 +865,50 @@ script:
   - id: end_session
     mode: restart
     then:
-      # Warten bis die Sprachausgabe wirklich durch ist, sonst kollidiert
-      # das Wake Word mit dem noch belegten I2S-Bus.
-      - wait_until:
+      # A completed TTS text does not mean audio playback has started. Avoid
+      # unnecessary waits if on_announcement already confirmed the start.
+      - if:
           condition:
-            media_player.is_announcing:
-          timeout: 0.5s
-      # Ohne Timeout haengt das Skript fuer immer, wenn der Speaker seinen
-      # Zustand nicht sauber zuruecksetzt - dann bleibt das Geraet ohne Wake
-      # Word in der Replying-Anzeige stehen. 30 s sind laenger als jede
-      # realistische TTS-Antwort.
+            lambda: return id(had_tts) && id(pipeline_session) && !id(tts_playback_seen);
+          then:
+            - wait_until:
+                condition:
+                  or:
+                    - lambda: return id(tts_playback_seen);
+                    - media_player.is_announcing:
+                    - speaker.is_playing:
+                timeout: 18s
+            - if:
+                condition:
+                  and:
+                    - lambda: return !id(tts_playback_seen);
+                    - not:
+                        media_player.is_announcing:
+                    - not:
+                        speaker.is_playing:
+                then:
+                  - logger.log:
+                      level: WARN
+                      format: "LUMI-AUDIO: TTS media playback did not start within 18s"
+      # Crucial: is_playing=false does not imply the I2S TX worker released
+      # the shared bus. Only is_stopped is a safe microphone restart boundary.
       - wait_until:
           condition:
             and:
               - not:
                   media_player.is_announcing:
-              - not:
-                  speaker.is_playing:
-          timeout: 30s
+              - speaker.is_stopped:
+                  id: spk
+          timeout: 90s
+      - if:
+          condition:
+            not:
+              speaker.is_stopped:
+                id: spk
+          then:
+            - logger.log:
+                level: ERROR
+                format: "LUMI-AUDIO: speaker did not stop within 90s; wake word stays off to protect I2S"
       # Bedenkzeit nach einer Ansage aus Home Assistant. on_announce feuert
       # end_trigger schon beim *Start* der Ansage (voice_assistant.cpp:1080),
       # dieses Skript laeuft also die ganze Ansage lang mit - und raeumte
@@ -900,20 +960,22 @@ script:
                 id: media_out
                 media_file: snd_confirm
                 announcement: true
-            # Ohne dieses Warten kaeme start_wake_word dem Ton zuvor und
-            # belegte den Bus, den er gerade erst bekommen hat.
+            # First observe an actual announcement start. Otherwise a fast
+            # is_playing=false check races ahead of the first audio sample.
             - wait_until:
                 condition:
-                  not:
-                    speaker.is_playing:
-                timeout: 5s
-            # Dieselben 500 ms wie beim Engine-Wechsel und beim Klingelton:
-            # speaker.is_playing wird false, sobald die letzten Samples
-            # abgegeben sind - den I2S-Bus gibt der Lautsprechertask aber erst
-            # danach frei. Ohne diese Pause scheitert micro_wake_word beim
-            # Griff aufs Mikrofon, und weil danach nichts mehr nachfasst, blieb
-            # das Geraet nach einem still ausgefuehrten Befehl taub.
-            - delay: 500ms
+                  or:
+                    - media_player.is_announcing:
+                    - speaker.is_playing:
+                timeout: 4s
+            - wait_until:
+                condition:
+                  and:
+                    - not:
+                        media_player.is_announcing:
+                    - speaker.is_stopped:
+                        id: spk
+                timeout: 12s
       # Erst scharfstellen, wenn die Komponente wirklich im Leerlauf ist - sonst
       # loescht das Scharfstellen die Rueckfrage, die es gerade auszuwerten
       # gilt.
@@ -947,7 +1009,24 @@ script:
       # Ueber das Skript statt direkt micro_wake_word.start: das beruecksichtigt
       # die gewaehlte Engine und respektiert eine waehrend des Vorgangs
       # gesetzte Stummschaltung.
-      - script.execute: start_wake_word
+      # A small guard interval also covers RX/TX driver scheduling jitter.
+      - delay: 250ms
+      - if:
+          condition:
+            and:
+              - not:
+                  media_player.is_announcing:
+              - speaker.is_stopped:
+                  id: spk
+          then:
+            - logger.log:
+                level: INFO
+                format: "LUMI-AUDIO: I2S speaker fully stopped; rearming wake word"
+            - script.execute: start_wake_word
+          else:
+            - logger.log:
+                level: ERROR
+                format: "LUMI-AUDIO: skipped wake restart: I2S TX not stopped"
       # Stehen bleibt nur, was man auch ansehen will: der Messwert bzw. der
       # Haken der Ergebnisanzeige. Die Balken der Sprachausgabe sind zu diesem
       # Zeitpunkt laengst weg - der Zweig oben hat die Phase mit dem letzten
@@ -1094,9 +1173,9 @@ script:
     then:
       - wait_until:
           condition:
-            not:
-              speaker.is_playing:
-          timeout: 5s
+            speaker.is_stopped:
+              id: spk
+          timeout: 12s
       # Hat inzwischen ein Sprachvorgang begonnen (on_listening ruft
       # timer_stop_ringing, bevor es die Phase setzt), gehoert der Bus ihm -
       # dessen end_session stellt das Wake Word selbst wieder scharf.
@@ -1106,7 +1185,16 @@ script:
               return id(voice_assistant_phase) == ${phase_idle}
                   || id(voice_assistant_phase) == ${phase_muted};
           then:
-            - script.execute: start_wake_word
+            - if:
+                condition:
+                  speaker.is_stopped:
+                    id: spk
+                then:
+                  - script.execute: start_wake_word
+                else:
+                  - logger.log:
+                      level: ERROR
+                      format: "LUMI-AUDIO: timer release blocked; I2S TX still active"
 
   # Schreibt den naechstfaelligen Timer (Globals timer_active/timer_left/
   # timer_name) in die beiden HA-Entities sensor_next_timer/
@@ -1160,7 +1248,14 @@ script:
   - id: announcement_guard
     mode: restart
     then:
+      - logger.log:
+          level: INFO
+          format: "LUMI-AUDIO: announcement guard stopping wake word"
       - micro_wake_word.stop:
+      # Home Assistant announcements can arrive while the local wake engine
+      # still owns the microphone; force a physical capture stop as backup.
+      - microphone.stop_capture:
+          id: mic
       - wait_until:
           condition:
             not:
@@ -1168,10 +1263,10 @@ script:
           timeout: 60s
       - wait_until:
           condition:
-            not:
-              speaker.is_playing:
-          timeout: 10s
-      - delay: 1s
+            speaker.is_stopped:
+              id: spk
+          timeout: 15s
+      - delay: 250ms
       - if:
           condition:
             and:
@@ -1182,7 +1277,14 @@ script:
                   voice_assistant.is_running:
               - not:
                   micro_wake_word.is_running:
+              - not:
+                  media_player.is_announcing:
+              - speaker.is_stopped:
+                  id: spk
           then:
+            - logger.log:
+                level: INFO
+                format: "LUMI-AUDIO: external announcement released I2S; restarting wake word"
             - script.execute: start_wake_word
 
   - id: clear_error
@@ -1197,8 +1299,13 @@ script:
       # laufenden Vorgang abwuergen - um den kuemmert sich end_session.
       - if:
           condition:
-            not:
-              voice_assistant.is_running:
+            and:
+              - not:
+                  voice_assistant.is_running:
+              - not:
+                  media_player.is_announcing:
+              - speaker.is_stopped:
+                  id: spk
           then:
             - script.execute: start_wake_word
       - script.execute: set_idle_or_muted
@@ -1305,8 +1412,8 @@ interval:
                   micro_wake_word.is_running:
               - not:
                   media_player.is_announcing:
-              - not:
-                  speaker.is_playing:
+              - speaker.is_stopped:
+                  id: spk
           then:
             # Bleibt dauerhaft drin und laeuft auf WARN: schlaegt der Wachhund
             # regelmaessig an, ist eine der Einzelkorrekturen unvollstaendig -
@@ -1343,8 +1450,8 @@ interval:
               - voice_assistant.is_running:
               - not:
                   media_player.is_announcing:
-              - not:
-                  speaker.is_playing:
+              - speaker.is_stopped:
+                  id: spk
           then:
             - logger.log:
                 level: WARN

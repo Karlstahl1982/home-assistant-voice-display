@@ -292,6 +292,16 @@ media_player:
     # Word ohnehin selbst gestoppt, und der Wiederanlauf am Ende prueft, ob
     # inzwischen jemand anders das Mikrofon hat.
     on_announcement:
+      # This event is raised as the media player begins an announcement.
+      # Restrict the marker to the current voice pipeline turn.
+      - if:
+          condition:
+            lambda: return id(pipeline_session) && id(had_tts);
+          then:
+            - lambda: id(tts_playback_seen) = true;
+            - logger.log:
+                level: INFO
+                format: "LUMI-AUDIO: media player accepted TTS announcement"
       - script.execute: announcement_guard
 
 switch:
